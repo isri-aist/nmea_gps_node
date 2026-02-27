@@ -4,19 +4,69 @@ from sensor_msgs.msg import NavSatFix, NavSatStatus
 import numpy as np
 
 import serial
+import serial.tools.list_ports
 import pynmea2
+import time
 
 QUALITY = ["0 - Fix not valid", "1 - GPS Fix", "2 - DGPS Fix", "3 - N/A", "4 - RTK Fix", "5 - RTK Float", "6 - INS Dead reckoning", "7 - Manual Input mode", "8 - Simulation mode"]
+COMMON_BAUDRATES = [4800, 9600, 115200]
+
 
 class GPSNode(Node):
     def __init__(self):
         super().__init__('nmea_gps_node')
 
-        self.declare_parameter('port', '/dev/ttyUSB0')
-        self.declare_parameter('baudrate', 115200)
+        self.declare_parameter('port', '')
+        self.declare_parameter('baudrate', -1)
 
         port = self.get_parameter('port').value
         baud = self.get_parameter('baudrate').value
+
+        if port == '' or baud == -1:
+            gpsReceivers = []
+            ports = serial.tools.list_ports.comports()
+            for port in ports:
+                if port.vid == None or port.pid == None:
+                    continue
+                self.get_logger().info(f"Device: {port.device}")
+                self.get_logger().info(f"  Description: {port.description}")
+                self.get_logger().info(f"  HWID: {port.hwid}")
+                self.get_logger().info(f"  VID: {port.vid}")
+                self.get_logger().info(f"  PID: {port.pid}")
+                
+
+                try:
+                    foundBaudRate = False
+                    for baud in COMMON_BAUDRATES:
+                        with serial.Serial(port.device, baud, timeout=0) as ser:
+                            time.sleep(1.5)
+                            validLines = 0
+                            for _ in range(10):
+                                raw = ser.readline()
+                                if not raw:
+                                    continue
+                                
+                                line = raw.decode(encoding='ascii', errors='ignore').strip()
+                                self.get_logger().info(f"[{baud}]: {line}")
+
+                                if line.startswith("$") and "*" in line:
+                                    validLines += 1
+
+                                if validLines >= 3:
+                                    self.get_logger().info(f"{port.device} @ {baud} outputs valid NMEA frames")
+                                    gpsReceivers.append((port.device, baud))
+                                    foundBaudRate = True
+                                    break
+
+                    if not foundBaudRate:
+                        self.get_logger().warn(f"No NMEA frames found for {port.device}")
+                        
+
+                except Exception as e:
+                    self.get_logger().error(f"Error {e}")
+
+            port, baud = gpsReceivers[0]
+        
 
         self.ser = serial.Serial(port, baud, timeout=1.0)
 
@@ -41,30 +91,42 @@ class GPSNode(Node):
         if type(msg) == pynmea2.talker.GGA:
             # print(repr(msg))
             # print(msg.__getattr__)
-            self.lat = msg.latitude
-            self.lon = msg.longitude
-            self.alt = msg.altitude
-            self.gps_qual = msg.gps_qual
-            self.num_sats = msg.num_sats
+            try:
+                self.lat = float(msg.latitude)
+                self.lon = float(msg.longitude)
+                self.alt = float(msg.altitude)
+                self.gps_qual = msg.gps_qual
+                self.num_sats = msg.num_sats
+                self.GGARX = True
+            except:
+                # self.get_logger().info(f"{msg}")
+                return
             
             # print(f"lat: {self.lat} \tlon: {self.lon} \talt: {self.alt} \tqual: {self.gps_qual}")
-            self.GGARX = True
 
         if type(msg) == pynmea2.talker.GSA:
-            self.gps_mode = msg.mode
-            self.fixType = msg.mode_fix_type
-            self.pdop = float(msg.pdop)
-            self.hdop = float(msg.hdop)
-            self.vdop = float(msg.vdop)
+            try:
+                self.gps_mode = msg.mode
+                self.fixType = msg.mode_fix_type
+                self.pdop = float(msg.pdop)
+                self.hdop = float(msg.hdop)
+                self.vdop = float(msg.vdop)
+                self.GSARX = True
+            except:
+                # self.get_logger().info(f"{msg}")
+                return
 
             # print(repr(msg))
             # print(f"gps mode: {self.gps_mode} \tfix type: {self.fixType} \tPDOP: {self.pdop} \tVDOP: {self.vdop} \tHDOP: {self.hdop}")
-            self.GSARX = True
+            
+            # self.get_logger().info(f"{repr(msg)}")
+            
 
         if self.GGARX == True and self.GSARX == True:
             self.GGARX = False
             self.GSARX = False
 
+            # try:
             fix = NavSatFix()
             fix.header.stamp = self.get_clock().now().to_msg()
             fix.header.frame_id = 'gps'
@@ -117,29 +179,17 @@ class GPSNode(Node):
             self.get_logger().info(f"Radius (95% conf.): {r95conf:.2f}m - (68% conf.): {r68conf:.2f}m \twith {self.num_sats} sats & quality = {QUALITY[self.gps_qual]}")
 
             self.pub.publish(fix)
+            # except:
+            #     self.get_logger().info(f"msg: {repr(msg)}, lat: {self.lat}, lon: {self.lon}, alt: {self.alt}")
 
-
-
-        # if hasattr(msg, 'latitude') and hasattr(msg, 'longitude'):
-        #     fix = NavSatFix()
-        #     fix.header.stamp = self.get_clock().now().to_msg()
-        #     fix.header.frame_id = 'gps'
-
-        #     fix.latitude = msg.latitude
-        #     fix.longitude = msg.longitude
-        #     fix.altitude = float(msg.altitude) if hasattr(msg, 'altitude') else 0.0
-
-        #     fix.status.status = NavSatStatus.STATUS_FIX
-        #     fix.status.service = NavSatStatus.SERVICE_GPS
-
-        #     self.pub.publish(fix)
 
 def main():
     rclpy.init()
     node = GPSNode()
     rclpy.spin(node)
     node.destroy_node()
-    rclpy.shutdown()
+    if rclpy.ok():
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
