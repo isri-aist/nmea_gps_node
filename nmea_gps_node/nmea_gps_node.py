@@ -7,6 +7,10 @@ import serial
 import serial.tools.list_ports
 import pynmea2
 import time
+import socket
+import base64
+
+import threading
 
 QUALITY = ["0 - Fix not valid", "1 - GPS Fix", "2 - DGPS Fix", "3 - N/A", "4 - RTK Fix", "5 - RTK Float", "6 - INS Dead reckoning", "7 - Manual Input mode", "8 - Simulation mode"]
 COMMON_BAUDRATES = [4800, 9600, 115200]
@@ -18,57 +22,36 @@ class GPSNode(Node):
 
         self.declare_parameter('port', '')
         self.declare_parameter('baudrate', -1)
+        self.declare_parameter('RTK', True)
+        self.declare_parameter('ntrip_user', 'antoine.caillot-at-aist.go.jp')
+        self.declare_parameter('ntrip_password', 'none')
+        self.declare_parameter('ntrip_url', 'rtk2go.com')
+        self.declare_parameter('ntrip_port', 2101)
+        self.declare_parameter('ntrip_mountpoint', 'IBRK_RyGSK-TJ00')
 
         port = self.get_parameter('port').value
         baud = self.get_parameter('baudrate').value
+        self.ntrip_user = self.get_parameter('ntrip_user').value
+        self.ntrip_password = self.get_parameter('ntrip_password').value
+        self.ntrip_url = self.get_parameter('ntrip_url').value
+        self.ntrip_port = self.get_parameter('ntrip_port').value
+        self.ntrip_mountpoint = self.get_parameter('ntrip_mountpoint').value
+
+        self.useRTK = self.get_parameter("RTK").value
+        
+        self.RTCM_thread_running = False
 
         if port == '' or baud == -1:
-            gpsReceivers = []
-            ports = serial.tools.list_ports.comports()
-            for port in ports:
-                if port.vid == None or port.pid == None:
-                    continue
-                self.get_logger().info(f"Device: {port.device}")
-                self.get_logger().info(f"  Description: {port.description}")
-                self.get_logger().info(f"  HWID: {port.hwid}")
-                self.get_logger().info(f"  VID: {port.vid}")
-                self.get_logger().info(f"  PID: {port.pid}")
-                
-
-                try:
-                    foundBaudRate = False
-                    for baud in COMMON_BAUDRATES:
-                        with serial.Serial(port.device, baud, timeout=0) as ser:
-                            time.sleep(1.5)
-                            validLines = 0
-                            for _ in range(10):
-                                raw = ser.readline()
-                                if not raw:
-                                    continue
-                                
-                                line = raw.decode(encoding='ascii', errors='ignore').strip()
-                                self.get_logger().info(f"[{baud}]: {line}")
-
-                                if line.startswith("$") and "*" in line:
-                                    validLines += 1
-
-                                if validLines >= 3:
-                                    self.get_logger().info(f"{port.device} @ {baud} outputs valid NMEA frames")
-                                    gpsReceivers.append((port.device, baud))
-                                    foundBaudRate = True
-                                    break
-
-                    if not foundBaudRate:
-                        self.get_logger().warn(f"No NMEA frames found for {port.device}")
-                        
-
-                except Exception as e:
-                    self.get_logger().error(f"Error {e}")
-
+            gpsReceivers = self.auto_detect_device()
             port, baud = gpsReceivers[0]
-        
 
-        self.ser = serial.Serial(port, baud, timeout=1.0)
+        self.ser = serial.Serial(port, baud, timeout=0.1)
+
+        if self.useRTK:
+            self.RTCM_thread_running = True
+            self.rtcm_client_thread = threading.Thread(target=self.RTCM_client)
+            self.rtcm_client_thread.daemon = True
+            self.rtcm_client_thread.start()
 
         self.pub = self.create_publisher(NavSatFix, 'fix', 10)
         self.timer = self.create_timer(0.1, self.read_gps)
@@ -76,6 +59,25 @@ class GPSNode(Node):
         self.get_logger().info(f"GPS connected on {port} @ {baud}")
         self.GGARX = False
         self.GSARX = False
+
+    def RTCM_client(self):
+        auth = base64.b64encode(f"{self.ntrip_user}:{self.ntrip_password}".encode()).decode()
+
+        req = (
+            f"GET /{self.ntrip_mountpoint} HTTP/1.0\r\n"
+            f"User-Agent: NTRIP PythonClient\r\n"
+            f"Authorization: Basic {auth}\r\n\r\n"
+        )
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((self.ntrip_url, self.ntrip_port))
+
+        sock.send(req.encode())
+
+        while self.RTCM_thread_running:
+            data = sock.recv(4096)
+            self.ser.write(data)
+
 
     def read_gps(self):
         line = self.ser.readline().decode(errors='ignore').strip()
@@ -181,6 +183,50 @@ class GPSNode(Node):
             self.pub.publish(fix)
             # except:
             #     self.get_logger().info(f"msg: {repr(msg)}, lat: {self.lat}, lon: {self.lon}, alt: {self.alt}")
+
+    def auto_detect_device(self):
+        gpsReceivers = []
+        ports = serial.tools.list_ports.comports()
+        for port in ports:
+            if port.vid == None or port.pid == None:
+                continue
+            self.get_logger().info(f"Device: {port.device}")
+            self.get_logger().info(f"  Description: {port.description}")
+            self.get_logger().info(f"  HWID: {port.hwid}")
+            self.get_logger().info(f"  VID: {port.vid}")
+            self.get_logger().info(f"  PID: {port.pid}")
+            
+
+            try:
+                foundBaudRate = False
+                for baud in COMMON_BAUDRATES:
+                    with serial.Serial(port.device, baud, timeout=0) as ser:
+                        time.sleep(1.5)
+                        validLines = 0
+                        for _ in range(10):
+                            raw = ser.readline()
+                            if not raw:
+                                continue
+                            
+                            line = raw.decode(encoding='ascii', errors='ignore').strip()
+                            self.get_logger().info(f"[{baud}]: {line}")
+
+                            if line.startswith("$") and "*" in line:
+                                validLines += 1
+
+                            if validLines >= 3:
+                                self.get_logger().info(f"{port.device} @ {baud} outputs valid NMEA frames")
+                                gpsReceivers.append((port.device, baud))
+                                foundBaudRate = True
+                                break
+
+                if not foundBaudRate:
+                    self.get_logger().warn(f"No NMEA frames found for {port.device}")
+                    
+
+            except Exception as e:
+                self.get_logger().error(f"Error {e}")
+        return gpsReceivers
 
 
 def main():
