@@ -13,6 +13,12 @@ from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from rclpy.node import Node
 from sensor_msgs.msg import NavSatFix, NavSatStatus
 
+try:
+    from gps_msgs.msg import GPSFix, GPSStatus
+except ModuleNotFoundError:
+    GPSFix = None
+    GPSStatus = None
+
 
 QUALITY = [
     "0 - Fix not valid",
@@ -48,6 +54,9 @@ class GPSNode(Node):
         self.declare_parameter('ntrip_reconnect_max_delay', 30.0)
         self.declare_parameter('nmea_pair_max_age', 2.0)
         self.declare_parameter('gst_max_age', 2.0)
+        self.declare_parameter('read_period', 0.02)
+        self.declare_parameter('serial_timeout', 0.01)
+        self.declare_parameter('max_nmea_lines_per_tick', 50)
 
         port = self.get_parameter('port').value
         baud = self.get_parameter('baudrate').value
@@ -67,6 +76,12 @@ class GPSNode(Node):
         )
         self.nmea_pair_max_age = self._positive_parameter('nmea_pair_max_age', 2.0)
         self.gst_max_age = self._positive_parameter('gst_max_age', 2.0)
+        self.read_period = self._positive_parameter('read_period', 0.02)
+        self.serial_timeout = self._positive_parameter('serial_timeout', 0.01)
+        self.max_nmea_lines_per_tick = self._positive_int_parameter(
+            'max_nmea_lines_per_tick',
+            50,
+        )
 
         self.useRTK = self.get_parameter('RTK').value
         self.ntrip_reconnect_max_delay = max(
@@ -105,11 +120,18 @@ class GPSNode(Node):
                 raise RuntimeError("No NMEA GPS receiver detected")
             port, baud = gpsReceivers[0]
 
-        self.ser = serial.Serial(port, baud, timeout=0.1)
+        self.ser = serial.Serial(port, baud, timeout=self.serial_timeout)
 
         self.pub = self.create_publisher(NavSatFix, 'fix', 10)
+        self.extended_pub = None
+        if GPSFix is None:
+            self.get_logger().warn(
+                "gps_msgs is not installed; fix_extended will not be published"
+            )
+        else:
+            self.extended_pub = self.create_publisher(GPSFix, 'fix_extended', 10)
         self.diagnostics_pub = self.create_publisher(DiagnosticArray, 'diagnostics', 10)
-        self.timer = self.create_timer(0.1, self.read_gps)
+        self.timer = self.create_timer(self.read_period, self.read_gps)
         self.diagnostics_timer = self.create_timer(1.0, self.publish_diagnostics)
 
         if self.useRTK:
@@ -123,6 +145,13 @@ class GPSNode(Node):
     def _positive_parameter(self, name, default):
         value = float(self.get_parameter(name).value)
         if value <= 0.0:
+            self.get_logger().warn(f"{name} must be > 0, using {default}")
+            return default
+        return value
+
+    def _positive_int_parameter(self, name, default):
+        value = int(self.get_parameter(name).value)
+        if value <= 0:
             self.get_logger().warn(f"{name} must be > 0, using {default}")
             return default
         return value
@@ -466,14 +495,32 @@ class GPSNode(Node):
         )
 
     def read_gps(self):
+        lines_read = 0
+
+        while lines_read < self.max_nmea_lines_per_tick:
+            try:
+                with self.serial_lock:
+                    raw = self.ser.readline()
+                    pending_bytes = self.ser.in_waiting
+            except serial.SerialException as e:
+                self.get_logger().error(f"Serial read failed: {e}")
+                return
+
+            if not raw:
+                return
+
+            lines_read += 1
+            self._process_nmea_line(raw)
+
+            if pending_bytes <= 0:
+                return
+
+    def _process_nmea_line(self, raw):
         try:
-            with self.serial_lock:
-                raw = self.ser.readline()
-        except serial.SerialException as e:
-            self.get_logger().error(f"Serial read failed: {e}")
+            line = raw.decode(errors='ignore').strip()
+        except AttributeError:
             return
 
-        line = raw.decode(errors='ignore').strip()
         if not line.startswith('$'):
             return
 
@@ -574,6 +621,8 @@ class GPSNode(Node):
 
         self._log_gps_feedback(gga, gsa, fix.position_covariance)
         self.pub.publish(fix)
+        if self.extended_pub is not None:
+            self.extended_pub.publish(self._build_extended_fix(gga, gsa, fix))
 
     def _navsat_status_from_quality(self, gps_qual):
         if gps_qual == 0:
@@ -581,6 +630,52 @@ class GPSNode(Node):
         if gps_qual == 4:
             return NavSatStatus.STATUS_GBAS_FIX
         return NavSatStatus.STATUS_FIX
+
+    def _gps_status_from_quality(self, gps_qual):
+        if gps_qual == 0:
+            return GPSStatus.STATUS_NO_FIX
+        if gps_qual == 2:
+            return getattr(GPSStatus, 'STATUS_DGPS_FIX', GPSStatus.STATUS_SBAS_FIX)
+        if gps_qual == 4:
+            return getattr(GPSStatus, 'STATUS_RTK_FIX', GPSStatus.STATUS_GBAS_FIX)
+        if gps_qual == 5:
+            return getattr(GPSStatus, 'STATUS_RTK_FLOAT', GPSStatus.STATUS_FIX)
+        return GPSStatus.STATUS_FIX
+
+    def _build_extended_fix(self, gga, gsa, navsat_fix):
+        fix = GPSFix()
+        fix.header = navsat_fix.header
+        fix.status.header = navsat_fix.header
+        fix.status.status = self._gps_status_from_quality(gga['gps_qual'])
+        fix.status.satellites_used = gga['num_sats']
+        fix.status.position_source = (
+            GPSStatus.SOURCE_NONE
+            if gga['gps_qual'] == 0
+            else GPSStatus.SOURCE_GPS
+        )
+        fix.status.motion_source = GPSStatus.SOURCE_NONE
+        fix.status.orientation_source = GPSStatus.SOURCE_NONE
+
+        fix.latitude = gga['lat']
+        fix.longitude = gga['lon']
+        fix.altitude = gga['alt']
+        fix.pdop = gsa['pdop']
+        fix.hdop = gsa['hdop']
+        fix.vdop = gsa['vdop']
+
+        fix.position_covariance = navsat_fix.position_covariance
+        fix.position_covariance_type = navsat_fix.position_covariance_type
+
+        east_var = fix.position_covariance[0]
+        north_var = fix.position_covariance[4]
+        up_var = fix.position_covariance[8]
+        sigma_h = math.sqrt(max(east_var, north_var))
+        sigma_v = math.sqrt(up_var)
+        fix.err_horz = math.sqrt(5.99) * sigma_h
+        fix.err_vert = 1.96 * sigma_v
+        fix.err = math.sqrt(fix.err_horz ** 2 + fix.err_vert ** 2)
+
+        return fix
 
     def _compute_covariance(self, gps_qual, gsa, now):
         if self.last_gst is not None and now - self.last_gst['monotonic'] <= self.gst_max_age:
